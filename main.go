@@ -47,6 +47,38 @@ type Config struct {
 	MaxTrustNetwork  int
 	MaxRelays        int
 	MaxOneHopNetwork int
+	SeedRelays       []string
+	ArchiveKinds     []int
+}
+
+var defaultSeedRelays = []string{
+	"wss://nos.lol",
+	"wss://nostr.mom",
+	"wss://purplepag.es",
+	"wss://purplerelay.com",
+	"wss://relay.damus.io",
+	"wss://relay.nostr.band",
+	"wss://relay.snort.social",
+	"wss://relayable.org",
+	"wss://relay.primal.net",
+	"wss://relay.nostr.bg",
+	"wss://no.str.cr",
+	"wss://nostr21.com",
+	"wss://nostrue.com",
+	"wss://relay.siamstr.com",
+}
+
+var defaultArchiveKinds = []int{
+	nostr.KindArticle,
+	nostr.KindDeletion,
+	nostr.KindFollowList,
+	nostr.KindEncryptedDirectMessage,
+	nostr.KindMuteList,
+	nostr.KindRelayListMetadata,
+	nostr.KindRepost,
+	nostr.KindZapRequest,
+	nostr.KindZap,
+	nostr.KindTextNote,
 }
 
 var pool *nostr.SimplePool
@@ -174,22 +206,7 @@ func main() {
 		return false, ""
 	})
 
-	seedRelays = []string{
-		"wss://nos.lol",
-		"wss://nostr.mom",
-		"wss://purplepag.es",
-		"wss://purplerelay.com",
-		"wss://relay.damus.io",
-		"wss://relay.nostr.band",
-		"wss://relay.snort.social",
-		"wss://relayable.org",
-		"wss://relay.primal.net",
-		"wss://relay.nostr.bg",
-		"wss://no.str.cr",
-		"wss://nostr21.com",
-		"wss://nostrue.com",
-		"wss://relay.siamstr.com",
-	}
+	seedRelays = config.SeedRelays
 
 	go refreshTrustNetwork(ctx, relay)
 	go monitorMemoryUsage() // Add memory monitoring
@@ -224,12 +241,16 @@ func main() {
 		}
 	})
 
-	log.Println("🎉 relay running on port :3334")
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "3334"
+	}
+	log.Printf("🎉 relay running on port :%s", port)
 	log.Println("🔍 debug endpoints available at:")
-	log.Println("   http://localhost:3334/debug/pprof/ (CPU/memory profiling)")
-	log.Println("   http://localhost:3334/debug/stats (application stats)")
-	log.Println("   http://localhost:3334/debug/goroutines (goroutine info)")
-	err := http.ListenAndServe(":3334", relay)
+	log.Printf("   http://localhost:%s/debug/pprof/ (CPU/memory profiling)", port)
+	log.Printf("   http://localhost:%s/debug/stats (application stats)", port)
+	log.Printf("   http://localhost:%s/debug/goroutines (goroutine info)", port)
+	err := http.ListenAndServe(":"+port, relay)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -292,6 +313,45 @@ func LoadConfig() Config {
 	maxRelays, _ := strconv.Atoi(os.Getenv("MAX_RELAYS"))
 	maxOneHopNetwork, _ := strconv.Atoi(os.Getenv("MAX_ONE_HOP_NETWORK"))
 
+	// Parse configurable seed relays, fall back to defaults
+	parsedSeedRelays := defaultSeedRelays
+	if sr := os.Getenv("SEED_RELAYS"); sr != "" {
+		parsedSeedRelays = splitAndTrim(sr)
+		log.Printf("🌱 using %d custom seed relays", len(parsedSeedRelays))
+	} else {
+		log.Printf("🌱 using %d default seed relays", len(parsedSeedRelays))
+	}
+
+	// Parse configurable archive kinds, fall back to defaults
+	archiveReactions := getEnv("ARCHIVE_REACTIONS") == "TRUE"
+	parsedArchiveKinds := make([]int, len(defaultArchiveKinds))
+	copy(parsedArchiveKinds, defaultArchiveKinds)
+	if ak := os.Getenv("ARCHIVE_KINDS"); ak != "" {
+		kindStrs := splitAndTrim(ak)
+		parsedArchiveKinds = []int{}
+		for _, ks := range kindStrs {
+			if k, err := strconv.Atoi(ks); err == nil {
+				parsedArchiveKinds = append(parsedArchiveKinds, k)
+			} else {
+				log.Printf("⚠️ ignoring invalid ARCHIVE_KINDS value: %s", ks)
+			}
+		}
+		log.Printf("📦 using %d custom archive kinds", len(parsedArchiveKinds))
+	}
+	// Add reaction kind if ARCHIVE_REACTIONS is enabled and not already present
+	if archiveReactions {
+		hasReaction := false
+		for _, k := range parsedArchiveKinds {
+			if k == nostr.KindReaction {
+				hasReaction = true
+				break
+			}
+		}
+		if !hasReaction {
+			parsedArchiveKinds = append(parsedArchiveKinds, nostr.KindReaction)
+		}
+	}
+
 	config := Config{
 		RelayName:        getEnv("RELAY_NAME"),
 		RelayPubkey:      getEnv("RELAY_PUBKEY"),
@@ -306,11 +366,13 @@ func LoadConfig() Config {
 		MinimumFollowers: minimumFollowers,
 		ArchivalSync:     getEnv("ARCHIVAL_SYNC") == "TRUE",
 		MaxAgeDays:       maxAgeDays,
-		ArchiveReactions: getEnv("ARCHIVE_REACTIONS") == "TRUE",
+		ArchiveReactions: archiveReactions,
 		IgnoredPubkeys:   ignoredPubkeys,
 		MaxTrustNetwork:  maxTrustNetwork,
 		MaxRelays:        maxRelays,
 		MaxOneHopNetwork: maxOneHopNetwork,
+		SeedRelays:       parsedSeedRelays,
+		ArchiveKinds:     parsedArchiveKinds,
 	}
 
 	return config
@@ -584,42 +646,11 @@ func archiveTrustedNotes(ctx context.Context, relay *khatru.Relay) {
 		if config.ArchivalSync {
 			go refreshProfiles(ctx)
 
-			var filters []nostr.Filter
 			since := nostr.Now()
-			if config.ArchiveReactions {
-				filters = []nostr.Filter{{
-					Kinds: []int{
-						nostr.KindArticle,
-						nostr.KindDeletion,
-						nostr.KindFollowList,
-						nostr.KindEncryptedDirectMessage,
-						nostr.KindMuteList,
-						nostr.KindReaction,
-						nostr.KindRelayListMetadata,
-						nostr.KindRepost,
-						nostr.KindZapRequest,
-						nostr.KindZap,
-						nostr.KindTextNote,
-					},
-					Since: &since,
-				}}
-			} else {
-				filters = []nostr.Filter{{
-					Kinds: []int{
-						nostr.KindArticle,
-						nostr.KindDeletion,
-						nostr.KindFollowList,
-						nostr.KindEncryptedDirectMessage,
-						nostr.KindMuteList,
-						nostr.KindRelayListMetadata,
-						nostr.KindRepost,
-						nostr.KindZapRequest,
-						nostr.KindZap,
-						nostr.KindTextNote,
-					},
-					Since: &since,
-				}}
-			}
+			filters := []nostr.Filter{{
+				Kinds: config.ArchiveKinds,
+				Since: &since,
+			}}
 
 			log.Println("📦 archiving trusted notes...")
 
@@ -707,19 +738,7 @@ func deleteOldNotes(relay *khatru.Relay) error {
 
 	filter := nostr.Filter{
 		Until: &oldAge,
-		Kinds: []int{
-			nostr.KindArticle,
-			nostr.KindDeletion,
-			nostr.KindFollowList,
-			nostr.KindEncryptedDirectMessage,
-			nostr.KindMuteList,
-			nostr.KindReaction,
-			nostr.KindRelayListMetadata,
-			nostr.KindRepost,
-			nostr.KindZapRequest,
-			nostr.KindZap,
-			nostr.KindTextNote,
-		},
+		Kinds: config.ArchiveKinds,
 		Limit: 1000, // Process in batches to avoid memory issues
 	}
 

@@ -67,6 +67,8 @@ MINIMUM_FOLLOWERS=3 #how many followers before they're allowed in the WoT
 ARCHIVAL_SYNC="FALSE" # set to TRUE to archive every note from every person in the WoT (not recommended)
 ARCHIVE_REACTIONS="FALSE" # set to TRUE to archive every reaction from every person in the WoT (not recommended)
 IGNORE_FOLLOWS_LIST="" # comma separated list of pubkeys who follow too many bots and ruin the WoT
+SEED_RELAYS="" # optional, comma separated WSS URLs for seed relays (uses built-in defaults if empty)
+ARCHIVE_KINDS="" # optional, comma separated event kind numbers to archive (uses defaults if empty)
 ```
 
 ### 4. Build the project
