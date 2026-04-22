@@ -22,7 +22,7 @@ ENV STATIC_PATH="templates/static"
 RUN touch .env
 
 # Build the Go application
-RUN go build -tags badger -o main .
+RUN go build -o main .
 
 # Expose the port that the application will run on
 EXPOSE 3334

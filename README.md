@@ -244,6 +244,83 @@ Once everything is set up, the relay will be running on `localhost:3334`.
 http://localhost:3334
 ```
 
+## Migrating from Badger to LMDB
+
+Older versions of wot-relay stored events in a Badger database. The relay now
+uses LMDB via `fiatjaf.com/nostr/eventstore/lmdb` and Badger is no longer
+supported. Because the two backends use different on-disk formats, an
+in-place upgrade is not possible — events must be exported to JSONL from the
+old store and re-imported into a fresh LMDB store.
+
+1. Stop the relay.
+2. Build the legacy exporter (separate module, uses the old Badger code):
+
+   ```bash
+   cd tools/export-badger
+   go build -o ../../export-badger .
+   cd ../..
+   ```
+3. Export every event to JSONL:
+
+   ```bash
+   ./export-badger -db ./db > events.jsonl
+   ```
+4. Move the old database aside (keep it until the new one is verified):
+
+   ```bash
+   mv ./db ./db.badger.bak
+   ```
+5. Build the new relay and importer:
+
+   ```bash
+   go build -ldflags "-X main.version=$(git describe --tags --always)"
+   go build -o import-jsonl ./cmd/import-jsonl
+   ```
+6. Populate a fresh LMDB directory:
+
+   ```bash
+   ./import-jsonl -db ./db < events.jsonl
+   ```
+7. Start the relay as normal. `DB_PATH` now points at the LMDB directory.
+
+### Migrating with Docker
+
+If you run wot-relay via Docker Compose, you don't need Go installed on the
+host — the steps above can be run inside the `golang:bookworm` image against
+the same `./db` bind mount your compose file already uses.
+
+1. Stop the relay:
+
+   ```bash
+   docker compose down
+   ```
+2. Export the Badger DB to JSONL:
+
+   ```bash
+   docker run --rm -v "$PWD:/src" -w /src golang:bookworm sh -c \
+       "cd tools/export-badger && go build -o /tmp/export-badger . && /tmp/export-badger -db /src/db > /src/events.jsonl"
+   ```
+3. Move the old database aside:
+
+   ```bash
+   mv db db.badger.bak
+   ```
+4. Import the JSONL into a fresh LMDB directory:
+
+   ```bash
+   docker run --rm -v "$PWD:/src" -w /src golang:bookworm sh -c \
+       "go build -o /tmp/import-jsonl ./cmd/import-jsonl && /tmp/import-jsonl -db /src/db < /src/events.jsonl"
+   ```
+5. Rebuild and start the relay:
+
+   ```bash
+   docker compose up -d --build
+   ```
+
+Files written by the `docker run` steps will be owned by root on the host
+because the container runs as root by default. If that's a problem, `chown`
+them back after migration.
+
 ## License
 
 This project is licensed under the MIT License.
