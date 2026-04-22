@@ -25,7 +25,7 @@ import (
 )
 
 var (
-	version string
+	version = "0.2.1"
 )
 
 type Config struct {
@@ -148,7 +148,7 @@ func main() {
 		Description: config.RelayDescription,
 		Contact:     config.RelayContact,
 		Icon:        config.RelayIcon,
-		Software:    "https://github.com/bitvora/wot-relay",
+		Software:    "https://github.com/barrydeen/wot-relay",
 		Version:     version,
 	}
 	if pk, err := nostr.PubKeyFromHex(config.RelayPubkey); err == nil {
