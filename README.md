@@ -6,25 +6,15 @@ WOT Relay is a Nostr relay that saves all the notes that people you follow, and 
 
 Don't want to run the relay, just want to connect to some? Here are some available relays:
 
-- [wss://wot.utxo.one](https://wot.utxo.one)
 - [wss://nostrelites.org](https://nostrelites.org)
 - [wss://wot.nostr.party](https://wot.nostr.party)
-- [wss://wot.sovbit.host](https://wot.sovbit.host)
 - [wss://wot.girino.org](https://wot.girino.org)
-- [wss://relay.lnau.net](https://relay.lnau.net)
-- [wss://wot.siamstr.com](https://wot.siamstr.com)
 - [wss://relay.lexingtonbitcoin.org](https://relay.lexingtonbitcoin.org)
 - [wss://wot.azzamo.net](https://wot.azzamo.net)
-- [wss://wot.swarmstr.com](https://wot.swarmstr.com)
-- [wss://zap.watch](https://zap.watch)
 - [wss://satsage.xyz](https://satsage.xyz)
-- [wss://wons.calva.dev](https://wons.calva.dev)
-- [wss://wot.zacoos.com](https://wot.zacoos.com)
 - [wss://wot.shaving.kiwi](https://wot.shaving.kiwi)
-- [wss://wot.tealeaf.dev](https://wot.tealeaf.dev)
 - [wss://wot.nostr.net](https://wot.nostr.net)
 - [wss://relay.goodmorningbitcoin.com](https://relay.goodmorningbitcoin.com)
-- [wss://wot.sudocarlos.com](https://wot.sudocarlos.com)
 - [wss://wot.dergigi.com/](https://wot.dergigi.com/)
 
 ## Prerequisites
