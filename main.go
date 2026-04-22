@@ -16,12 +16,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/fiatjaf/eventstore"
-	"github.com/fiatjaf/eventstore/badger"
-	"github.com/fiatjaf/khatru"
-	"github.com/fiatjaf/khatru/policies"
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/eventstore/lmdb"
+	"fiatjaf.com/nostr/khatru"
+	"fiatjaf.com/nostr/khatru/policies"
+	"fiatjaf.com/nostr/nip11"
 	"github.com/joho/godotenv"
-	"github.com/nbd-wtf/go-nostr"
 )
 
 var (
@@ -48,7 +48,7 @@ type Config struct {
 	MaxRelays        int
 	MaxOneHopNetwork int
 	SeedRelays       []string
-	ArchiveKinds     []int
+	ArchiveKinds     []nostr.Kind
 }
 
 var defaultSeedRelays = []string{
@@ -68,7 +68,7 @@ var defaultSeedRelays = []string{
 	"wss://relay.siamstr.com",
 }
 
-var defaultArchiveKinds = []int{
+var defaultArchiveKinds = []nostr.Kind{
 	nostr.KindArticle,
 	nostr.KindDeletion,
 	nostr.KindFollowList,
@@ -81,8 +81,8 @@ var defaultArchiveKinds = []int{
 	nostr.KindTextNote,
 }
 
-var pool *nostr.SimplePool
-var wdb nostr.RelayStore
+var pool *nostr.Pool
+var db *lmdb.LMDBBackend
 var relays []string
 var relaySet = make(map[string]bool) // O(1) lookup
 var config Config
@@ -96,7 +96,7 @@ var trustNetworkMap map[string]bool
 var pubkeyFollowerCount = make(map[string]int)
 var trustedNotes uint64
 var untrustedNotes uint64
-var archiveEventSemaphore = make(chan struct{}, 20) // Reduced from 100 to 20
+var archiveEventSemaphore = make(chan struct{}, 20)
 
 // Performance counters
 var (
@@ -122,95 +122,93 @@ func main() {
 	reset := "\033[0m"
 
 	art := `
-888       888      88888888888      8888888b.          888                   
-888   o   888          888          888   Y88b         888                   
-888  d8b  888          888          888    888         888                   
-888 d888b 888  .d88b.  888          888   d88P .d88b.  888  8888b.  888  888 
-888d88888b888 d88""88b 888          8888888P" d8P  Y8b 888     "88b 888  888 
-88888P Y88888 888  888 888          888 T88b  88888888 888 .d888888 888  888 
-8888P   Y8888 Y88..88P 888          888  T88b Y8b.     888 888  888 Y88b 888 
-888P     Y888  "Y88P"  888          888   T88b "Y8888  888 "Y888888  "Y88888 
-                                                                         888 
-                                                                    Y8b d88P 
-                                               powered by: khatru     "Y88P"  
+888       888      88888888888      8888888b.          888
+888   o   888          888          888   Y88b         888
+888  d8b  888          888          888    888         888
+888 d888b 888  .d88b.  888          888   d88P .d88b.  888  8888b.  888  888
+888d88888b888 d88""88b 888          8888888P" d8P  Y8b 888     "88b 888  888
+88888P Y88888 888  888 888          888 T88b  88888888 888 .d888888 888  888
+8888P   Y8888 Y88..88P 888          888  T88b Y8b.     888 888  888 Y88b 888
+888P     Y888  "Y88P"  888          888   T88b "Y8888  888 "Y888888  "Y88888
+                                                                         888
+                                                                    Y8b d88P
+                                               powered by: khatru     "Y88P"
 	`
 
 	fmt.Println(green + art + reset)
 	log.Println("🚀 booting up web of trust relay")
 	relay := khatru.NewRelay()
 	ctx := context.Background()
-	pool = nostr.NewSimplePool(ctx)
+	pool = nostr.NewPool()
+	pool.Context = ctx
 	config = LoadConfig()
 
-	relay.Info.Name = config.RelayName
-	relay.Info.PubKey = config.RelayPubkey
-	relay.Info.Icon = config.RelayIcon
-	relay.Info.Contact = config.RelayContact
-	relay.Info.Description = config.RelayDescription
-	relay.Info.Software = "https://github.com/bitvora/wot-relay"
-	relay.Info.Version = version
+	relay.Info = &nip11.RelayInformationDocument{
+		Name:        config.RelayName,
+		Description: config.RelayDescription,
+		Contact:     config.RelayContact,
+		Icon:        config.RelayIcon,
+		Software:    "https://github.com/bitvora/wot-relay",
+		Version:     version,
+	}
+	if pk, err := nostr.PubKeyFromHex(config.RelayPubkey); err == nil {
+		relay.Info.PubKey = &pk
+	}
 
 	appendPubkey(config.RelayPubkey)
 
-	db := getDB()
+	db = &lmdb.LMDBBackend{Path: config.DBPath}
 	if err := db.Init(); err != nil {
 		panic(err)
 	}
-	wdb = eventstore.RelayWrapper{Store: &db}
+	relay.UseEventstore(db, 500)
 
-	relay.RejectEvent = append(relay.RejectEvent,
+	relay.OnEvent = policies.SeqEvent(
 		policies.RejectEventsWithBase64Media,
 		policies.EventIPRateLimiter(5, time.Minute*1, 30),
+		func(ctx context.Context, event nostr.Event) (bool, string) {
+			atomic.AddUint64(&totalEvents, 1)
+
+			pkHex := event.PubKey.Hex()
+			trustNetworkMutex.RLock()
+			trusted := trustNetworkMap[pkHex]
+			hasNetwork := len(trustNetworkMap) > 0
+			trustNetworkMutex.RUnlock()
+
+			// While the trust network is still being built for the first time (no
+			// list yet), accept everything. On subsequent rebuilds the old map
+			// remains active via atomic swap, so we never reject against an empty
+			// list.
+			if !hasNetwork {
+				return false, ""
+			}
+
+			if !trusted {
+				atomic.AddUint64(&rejectedEvents, 1)
+				return true, "not in web of trust"
+			}
+			if event.Kind == nostr.KindEncryptedDirectMessage {
+				atomic.AddUint64(&rejectedEvents, 1)
+				return true, "only gift wrapped DMs are allowed"
+			}
+
+			return false, ""
+		},
 	)
 
-	relay.RejectFilter = append(relay.RejectFilter,
+	relay.OnRequest = policies.SeqRequest(
 		policies.NoEmptyFilters,
 		policies.NoComplexFilters,
 		policies.FilterIPRateLimiter(5, time.Minute*1, 30),
 	)
 
-	relay.RejectConnection = append(relay.RejectConnection,
-		policies.ConnectionRateLimiter(10, time.Minute*2, 30),
-	)
-
-	relay.StoreEvent = append(relay.StoreEvent, db.SaveEvent)
-	relay.QueryEvents = append(relay.QueryEvents, db.QueryEvents)
-	relay.DeleteEvent = append(relay.DeleteEvent, db.DeleteEvent)
-	relay.RejectEvent = append(relay.RejectEvent, func(ctx context.Context, event *nostr.Event) (bool, string) {
-		atomic.AddUint64(&totalEvents, 1)
-
-		// Don't reject events if we haven't booted yet or if trust network is empty
-		if !booted {
-			return false, ""
-		}
-
-		trustNetworkMutex.RLock()
-		trusted := trustNetworkMap[event.PubKey]
-		hasNetwork := len(trustNetworkMap) > 0
-		trustNetworkMutex.RUnlock()
-
-		// If we don't have a trust network yet, allow all events
-		if !hasNetwork {
-			return false, ""
-		}
-
-		if !trusted {
-			atomic.AddUint64(&rejectedEvents, 1)
-			return true, "not in web of trust"
-		}
-		if event.Kind == nostr.KindEncryptedDirectMessage {
-			atomic.AddUint64(&rejectedEvents, 1)
-			return true, "only gift wrapped DMs are allowed"
-		}
-
-		return false, ""
-	})
+	relay.RejectConnection = policies.ConnectionRateLimiter(10, time.Minute*2, 30)
 
 	seedRelays = config.SeedRelays
 
 	go refreshTrustNetwork(ctx, relay)
-	go monitorMemoryUsage() // Add memory monitoring
-	go monitorPerformance() // Add performance monitoring
+	go monitorMemoryUsage()
+	go monitorPerformance()
 
 	mux := relay.Router()
 	static := http.FileServer(http.Dir(config.StaticPath))
@@ -218,7 +216,6 @@ func main() {
 	mux.Handle("GET /static/", http.StripPrefix("/static/", static))
 	mux.Handle("GET /favicon.ico", http.StripPrefix("/", static))
 
-	// Add debug endpoints
 	mux.HandleFunc("GET /debug/stats", debugStatsHandler)
 	mux.HandleFunc("GET /debug/goroutines", debugGoroutinesHandler)
 
@@ -324,14 +321,14 @@ func LoadConfig() Config {
 
 	// Parse configurable archive kinds, fall back to defaults
 	archiveReactions := getEnv("ARCHIVE_REACTIONS") == "TRUE"
-	parsedArchiveKinds := make([]int, len(defaultArchiveKinds))
+	parsedArchiveKinds := make([]nostr.Kind, len(defaultArchiveKinds))
 	copy(parsedArchiveKinds, defaultArchiveKinds)
 	if ak := os.Getenv("ARCHIVE_KINDS"); ak != "" {
 		kindStrs := splitAndTrim(ak)
-		parsedArchiveKinds = []int{}
+		parsedArchiveKinds = []nostr.Kind{}
 		for _, ks := range kindStrs {
 			if k, err := strconv.Atoi(ks); err == nil {
-				parsedArchiveKinds = append(parsedArchiveKinds, k)
+				parsedArchiveKinds = append(parsedArchiveKinds, nostr.Kind(k))
 			} else {
 				log.Printf("⚠️ ignoring invalid ARCHIVE_KINDS value: %s", ks)
 			}
@@ -432,6 +429,16 @@ func updateTrustNetworkFilter() {
 	followerMutex.Unlock()
 }
 
+func hexToPubKeys(hexes []string) []nostr.PubKey {
+	out := make([]nostr.PubKey, 0, len(hexes))
+	for _, h := range hexes {
+		if pk, err := nostr.PubKeyFromHex(h); err == nil {
+			out = append(out, pk)
+		}
+	}
+	return out
+}
+
 func refreshProfiles(ctx context.Context) {
 	atomic.AddUint64(&profileRefreshCount, 1)
 	start := time.Now()
@@ -442,25 +449,44 @@ func refreshProfiles(ctx context.Context) {
 	copy(currentTrustNetwork, trustNetwork)
 	trustNetworkMutex.RUnlock()
 
-	for i := 0; i < len(currentTrustNetwork); i += 200 {
-		timeout, cancel := context.WithTimeout(ctx, 4*time.Second)
+	const (
+		profileBatchSize    = 500
+		profileConcurrency  = 5
+		profileBatchTimeout = 30 * time.Second
+	)
 
-		end := i + 200
+	sem := make(chan struct{}, profileConcurrency)
+	var wg sync.WaitGroup
+
+	for i := 0; i < len(currentTrustNetwork); i += profileBatchSize {
+		end := i + profileBatchSize
 		if end > len(currentTrustNetwork) {
 			end = len(currentTrustNetwork)
 		}
+		batch := currentTrustNetwork[i:end]
 
-		filters := []nostr.Filter{{
-			Authors: currentTrustNetwork[i:end],
-			Kinds:   []int{nostr.KindProfileMetadata},
-		}}
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(batch []string) {
+			defer wg.Done()
+			defer func() { <-sem }()
 
-		for ev := range pool.SubManyEose(timeout, seedRelays, filters) {
-			wdb.Publish(ctx, *ev.Event)
-		}
+			timeout, cancel := context.WithTimeout(ctx, profileBatchTimeout)
+			defer cancel()
 
-		cancel() // Cancel after each iteration
+			filter := nostr.Filter{
+				Authors: hexToPubKeys(batch),
+				Kinds:   []nostr.Kind{nostr.KindProfileMetadata},
+			}
+
+			for ev := range pool.FetchMany(timeout, seedRelays, filter, nostr.SubscriptionOptions{}) {
+				if err := db.SaveEvent(ev.Event); err != nil {
+					nostr.InfoLogger.Printf("save profile: %v", err)
+				}
+			}
+		}(batch)
 	}
+	wg.Wait()
 	duration := time.Since(start)
 	log.Printf("👤 profiles refreshed: %d profiles in %v", len(currentTrustNetwork), duration)
 }
@@ -485,71 +511,111 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 		timeoutCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 
-		filters := []nostr.Filter{{
-			Authors: []string{config.RelayPubkey},
-			Kinds:   []int{nostr.KindFollowList},
-		}}
+		ownerPk, err := nostr.PubKeyFromHex(config.RelayPubkey)
+		if err != nil {
+			log.Printf("invalid RELAY_PUBKEY: %v", err)
+			return
+		}
+		filter := nostr.Filter{
+			Authors: []nostr.PubKey{ownerPk},
+			Kinds:   []nostr.Kind{nostr.KindFollowList},
+		}
 
 		log.Println("🔍 fetching owner's follows")
 		eventCount := 0
-		for ev := range pool.SubManyEose(timeoutCtx, seedRelays, filters) {
+		for ev := range pool.FetchMany(timeoutCtx, seedRelays, filter, nostr.SubscriptionOptions{}) {
 			eventCount++
-			for _, contact := range ev.Event.Tags.GetAll([]string{"p"}) {
+			for contact := range ev.Tags.FindAll("p") {
+				if len(contact) < 2 {
+					continue
+				}
 				pubkey := contact[1]
 				if isIgnored(pubkey, config.IgnoredPubkeys) {
 					fmt.Println("ignoring follows from pubkey: ", pubkey)
 					continue
 				}
-				newPubkeyFollowerCount[contact[1]]++
+				newPubkeyFollowerCount[pubkey]++
 
 				// Add to new one-hop network
-				if !newOneHopNetworkSet[contact[1]] && len(contact[1]) == 64 && len(newOneHopNetwork) < config.MaxOneHopNetwork {
-					newOneHopNetwork = append(newOneHopNetwork, contact[1])
-					newOneHopNetworkSet[contact[1]] = true
+				if !newOneHopNetworkSet[pubkey] && len(pubkey) == 64 && len(newOneHopNetwork) < config.MaxOneHopNetwork {
+					newOneHopNetwork = append(newOneHopNetwork, pubkey)
+					newOneHopNetworkSet[pubkey] = true
 				}
 			}
 		}
 		log.Printf("🔍 processed %d follow list events", eventCount)
 
 		log.Println("🌐 building web of trust graph")
-		totalProcessed := 0
-		for i := 0; i < len(newOneHopNetwork); i += 100 {
-			timeout, cancel := context.WithTimeout(ctx, 4*time.Second)
+		var totalProcessed int64
+		var followerCountMu sync.Mutex
 
-			end := i + 100
+		const (
+			wotBatchSize    = 500
+			wotConcurrency  = 5
+			wotBatchTimeout = 30 * time.Second
+		)
+
+		sem := make(chan struct{}, wotConcurrency)
+		var wg sync.WaitGroup
+		var completedBatches int64
+		totalBatches := (len(newOneHopNetwork) + wotBatchSize - 1) / wotBatchSize
+
+		for i := 0; i < len(newOneHopNetwork); i += wotBatchSize {
+			end := i + wotBatchSize
 			if end > len(newOneHopNetwork) {
 				end = len(newOneHopNetwork)
 			}
+			batch := newOneHopNetwork[i:end]
 
-			filters = []nostr.Filter{{
-				Authors: newOneHopNetwork[i:end],
-				Kinds:   []int{nostr.KindFollowList, nostr.KindRelayListMetadata, nostr.KindProfileMetadata},
-			}}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(batch []string) {
+				defer wg.Done()
+				defer func() { <-sem }()
 
-			batchCount := 0
-			for ev := range pool.SubManyEose(timeout, seedRelays, filters) {
-				batchCount++
-				totalProcessed++
-				for _, contact := range ev.Event.Tags.GetAll([]string{"p"}) {
-					if len(contact) > 1 {
-						newPubkeyFollowerCount[contact[1]]++
+				timeout, cancel := context.WithTimeout(ctx, wotBatchTimeout)
+				defer cancel()
+
+				filter := nostr.Filter{
+					Authors: hexToPubKeys(batch),
+					Kinds:   []nostr.Kind{nostr.KindFollowList, nostr.KindRelayListMetadata, nostr.KindProfileMetadata},
+				}
+
+				for ev := range pool.FetchMany(timeout, seedRelays, filter, nostr.SubscriptionOptions{}) {
+					atomic.AddInt64(&totalProcessed, 1)
+
+					hasP := false
+					followerCountMu.Lock()
+					for contact := range ev.Tags.FindAll("p") {
+						if len(contact) > 1 {
+							newPubkeyFollowerCount[contact[1]]++
+							hasP = true
+						}
+					}
+					followerCountMu.Unlock()
+					_ = hasP
+
+					for relayTag := range ev.Tags.FindAll("r") {
+						if len(relayTag) > 1 {
+							appendRelay(relayTag[1])
+						}
+					}
+
+					if ev.Kind == nostr.KindProfileMetadata {
+						if err := db.SaveEvent(ev.Event); err != nil {
+							nostr.InfoLogger.Printf("save profile: %v", err)
+						}
 					}
 				}
 
-				for _, relay := range ev.Event.Tags.GetAll([]string{"r"}) {
-					appendRelay(relay[1])
+				done := atomic.AddInt64(&completedBatches, 1)
+				if done%10 == 0 || done == int64(totalBatches) {
+					log.Printf("🌐 wot graph: %d/%d batches complete (%d events so far)",
+						done, totalBatches, atomic.LoadInt64(&totalProcessed))
 				}
-
-				if ev.Event.Kind == nostr.KindProfileMetadata {
-					wdb.Publish(ctx, *ev.Event)
-				}
-			}
-			cancel() // Cancel after each iteration
-
-			if i%500 == 0 { // Log progress every 5 batches
-				log.Printf("🌐 processed batch %d-%d (%d events in this batch)", i, end, batchCount)
-			}
+			}(batch)
 		}
+		wg.Wait()
 
 		// Now atomically replace the active data structures
 		oneHopMutex.Lock()
@@ -562,7 +628,7 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 		followerMutex.Unlock()
 
 		duration := time.Since(start)
-		log.Printf("🫂 total network size: %d (processed %d events in %v)", len(newPubkeyFollowerCount), totalProcessed, duration)
+		log.Printf("🫂 total network size: %d (processed %d events in %v)", len(newPubkeyFollowerCount), atomic.LoadInt64(&totalProcessed), duration)
 		relayMutex.RLock()
 		log.Println("🔗 relays discovered:", len(relays))
 		relayMutex.RUnlock()
@@ -580,7 +646,7 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 	booted = true
 	log.Println("✅ trust network initialized, relay is now active")
 
-	deleteOldNotes(relay)
+	deleteOldNotes()
 	archiveTrustedNotes(ctx, relay)
 
 	// Then run on timer
@@ -590,7 +656,7 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 			log.Println("🔄 refreshing trust network in background...")
 			runTrustNetworkRefresh()
 			updateTrustNetworkFilter()
-			deleteOldNotes(relay)
+			deleteOldNotes()
 			archiveTrustedNotes(ctx, relay)
 			log.Println("✅ trust network refresh completed")
 		case <-ctx.Done():
@@ -647,15 +713,15 @@ func archiveTrustedNotes(ctx context.Context, relay *khatru.Relay) {
 			go refreshProfiles(ctx)
 
 			since := nostr.Now()
-			filters := []nostr.Filter{{
+			filter := nostr.Filter{
 				Kinds: config.ArchiveKinds,
-				Since: &since,
-			}}
+				Since: since,
+			}
 
 			log.Println("📦 archiving trusted notes...")
 
 			eventCount := 0
-			for ev := range pool.SubMany(timeout, seedRelays, filters) {
+			for ev := range pool.SubscribeMany(timeout, seedRelays, filter, nostr.SubscriptionOptions{}) {
 				eventCount++
 
 				// Check GC pressure every 1000 events
@@ -663,11 +729,10 @@ func archiveTrustedNotes(ctx context.Context, relay *khatru.Relay) {
 					var m runtime.MemStats
 					runtime.ReadMemStats(&m)
 					if m.NumGC > 0 && eventCount > 1000 {
-						// If we're doing more than 2 GCs per 1000 events, slow down
 						gcRate := float64(m.NumGC) / float64(eventCount/1000)
 						if gcRate > 2.0 {
 							log.Printf("⚠️ High GC pressure (%.1f GC/1000 events), slowing archive process", gcRate)
-							time.Sleep(100 * time.Millisecond) // Brief pause
+							time.Sleep(100 * time.Millisecond)
 						}
 					}
 				}
@@ -678,13 +743,12 @@ func archiveTrustedNotes(ctx context.Context, relay *khatru.Relay) {
 					go func(event nostr.Event) {
 						defer func() { <-archiveEventSemaphore }()
 						archiveEvent(ctx, relay, event)
-					}(*ev.Event)
+					}(ev.Event)
 				case <-timeout.Done():
 					log.Printf("📦 archive timeout reached, processed %d events", eventCount)
 					return
 				default:
-					// If semaphore is full, process synchronously to avoid buildup
-					archiveEvent(ctx, relay, *ev.Event)
+					archiveEvent(ctx, relay, ev.Event)
 				}
 			}
 
@@ -692,9 +756,7 @@ func archiveTrustedNotes(ctx context.Context, relay *khatru.Relay) {
 				atomic.LoadUint64(&trustedNotes), atomic.LoadUint64(&untrustedNotes), eventCount)
 		} else {
 			log.Println("🔄 web of trust will refresh in", config.RefreshInterval, "hours")
-			select {
-			case <-timeout.Done():
-			}
+			<-timeout.Done()
 		}
 	}()
 
@@ -708,12 +770,14 @@ func archiveTrustedNotes(ctx context.Context, relay *khatru.Relay) {
 
 func archiveEvent(ctx context.Context, relay *khatru.Relay, ev nostr.Event) {
 	trustNetworkMutex.RLock()
-	trusted := trustNetworkMap[ev.PubKey]
+	trusted := trustNetworkMap[ev.PubKey.Hex()]
 	trustNetworkMutex.RUnlock()
 
 	if trusted {
-		wdb.Publish(ctx, ev)
-		relay.BroadcastEvent(&ev)
+		if err := db.SaveEvent(ev); err != nil {
+			nostr.InfoLogger.Printf("save event: %v", err)
+		}
+		relay.BroadcastEvent(ev)
 		atomic.AddUint64(&trustedNotes, 1)
 		atomic.AddUint64(&archivedEvents, 1)
 	} else {
@@ -721,9 +785,7 @@ func archiveEvent(ctx context.Context, relay *khatru.Relay, ev nostr.Event) {
 	}
 }
 
-func deleteOldNotes(relay *khatru.Relay) error {
-	ctx := context.TODO()
-
+func deleteOldNotes() error {
 	if config.MaxAgeDays <= 0 {
 		log.Printf("MAX_AGE_DAYS disabled")
 		return nil
@@ -737,50 +799,18 @@ func deleteOldNotes(relay *khatru.Relay) error {
 	}
 
 	filter := nostr.Filter{
-		Until: &oldAge,
+		Until: oldAge,
 		Kinds: config.ArchiveKinds,
-		Limit: 1000, // Process in batches to avoid memory issues
+		Limit: 1000,
 	}
 
-	ch, err := relay.QueryEvents[0](ctx, filter)
-	if err != nil {
-		log.Printf("query error %s", err)
-		return err
-	}
-
-	// Process events in batches to avoid memory issues
-	batchSize := 100
-	events := make([]*nostr.Event, 0, batchSize)
 	count := 0
-
-	for evt := range ch {
-		events = append(events, evt)
+	for evt := range db.QueryEvents(filter, 1000) {
+		if err := db.DeleteEvent(evt.ID); err != nil {
+			log.Printf("error deleting note %s: %v", evt.ID, err)
+			return err
+		}
 		count++
-
-		if len(events) >= batchSize {
-			// Delete this batch
-			for num_evt, del_evt := range events {
-				for _, del := range relay.DeleteEvent {
-					if err := del(ctx, del_evt); err != nil {
-						log.Printf("error deleting note %d of batch. event id: %s", num_evt, del_evt.ID)
-						return err
-					}
-				}
-			}
-			events = events[:0] // Reset slice but keep capacity
-		}
-	}
-
-	// Delete remaining events
-	if len(events) > 0 {
-		for num_evt, del_evt := range events {
-			for _, del := range relay.DeleteEvent {
-				if err := del(ctx, del_evt); err != nil {
-					log.Printf("error deleting note %d of final batch. event id: %s", num_evt, del_evt.ID)
-					return err
-				}
-			}
-		}
 	}
 
 	if count == 0 {
@@ -790,12 +820,6 @@ func deleteOldNotes(relay *khatru.Relay) error {
 	}
 
 	return nil
-}
-
-func getDB() badger.BadgerBackend {
-	return badger.BadgerBackend{
-		Path: getEnv("DB_PATH"),
-	}
 }
 
 func splitAndTrim(input string) []string {
@@ -820,33 +844,30 @@ func monitorMemoryUsage() {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
+	for range ticker.C {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
 
-			relayMutex.RLock()
-			relayCount := len(relays)
-			relayMutex.RUnlock()
+		relayMutex.RLock()
+		relayCount := len(relays)
+		relayMutex.RUnlock()
 
-			trustNetworkMutex.RLock()
-			trustNetworkCount := len(trustNetwork)
-			trustNetworkMutex.RUnlock()
+		trustNetworkMutex.RLock()
+		trustNetworkCount := len(trustNetwork)
+		trustNetworkMutex.RUnlock()
 
-			oneHopMutex.RLock()
-			oneHopCount := len(oneHopNetwork)
-			oneHopMutex.RUnlock()
+		oneHopMutex.RLock()
+		oneHopCount := len(oneHopNetwork)
+		oneHopMutex.RUnlock()
 
-			followerMutex.RLock()
-			followerCount := len(pubkeyFollowerCount)
-			followerMutex.RUnlock()
+		followerMutex.RLock()
+		followerCount := len(pubkeyFollowerCount)
+		followerMutex.RUnlock()
 
-			log.Printf("📊 Memory: Alloc=%d KB, Sys=%d KB, NumGC=%d",
-				m.Alloc/1024, m.Sys/1024, m.NumGC)
-			log.Printf("📊 Data structures: Relays=%d, TrustNetwork=%d, OneHop=%d, Followers=%d",
-				relayCount, trustNetworkCount, oneHopCount, followerCount)
-		}
+		log.Printf("📊 Memory: Alloc=%d KB, Sys=%d KB, NumGC=%d",
+			m.Alloc/1024, m.Sys/1024, m.NumGC)
+		log.Printf("📊 Data structures: Relays=%d, TrustNetwork=%d, OneHop=%d, Followers=%d",
+			relayCount, trustNetworkCount, oneHopCount, followerCount)
 	}
 }
 
@@ -858,39 +879,36 @@ func monitorPerformance() {
 	var lastGC uint32
 	var lastEvents, lastRejected, lastArchived uint64
 
-	for {
-		select {
-		case <-ticker.C:
-			var m runtime.MemStats
-			runtime.ReadMemStats(&m)
+	for range ticker.C {
+		var m runtime.MemStats
+		runtime.ReadMemStats(&m)
 
-			currentEvents := atomic.LoadUint64(&totalEvents)
-			currentRejected := atomic.LoadUint64(&rejectedEvents)
-			currentArchived := atomic.LoadUint64(&archivedEvents)
+		currentEvents := atomic.LoadUint64(&totalEvents)
+		currentRejected := atomic.LoadUint64(&rejectedEvents)
+		currentArchived := atomic.LoadUint64(&archivedEvents)
 
-			eventsPerMin := currentEvents - lastEvents
-			rejectedPerMin := currentRejected - lastRejected
-			archivedPerMin := currentArchived - lastArchived
-			gcPerMin := m.NumGC - lastGC
+		eventsPerMin := currentEvents - lastEvents
+		rejectedPerMin := currentRejected - lastRejected
+		archivedPerMin := currentArchived - lastArchived
+		gcPerMin := m.NumGC - lastGC
 
-			numGoroutines := runtime.NumGoroutine()
+		numGoroutines := runtime.NumGoroutine()
 
-			log.Printf("⚡ Performance: Events/min=%d, Rejected/min=%d, Archived/min=%d, GC/min=%d, Goroutines=%d",
-				eventsPerMin, rejectedPerMin, archivedPerMin, gcPerMin, numGoroutines)
+		log.Printf("⚡ Performance: Events/min=%d, Rejected/min=%d, Archived/min=%d, GC/min=%d, Goroutines=%d",
+			eventsPerMin, rejectedPerMin, archivedPerMin, gcPerMin, numGoroutines)
 
-			if gcPerMin > 60 {
-				log.Printf("⚠️  HIGH GC ACTIVITY: %d garbage collections in last minute!", gcPerMin)
-			}
-
-			if numGoroutines > 1000 {
-				log.Printf("⚠️  HIGH GOROUTINE COUNT: %d goroutines active!", numGoroutines)
-			}
-
-			lastGC = m.NumGC
-			lastEvents = currentEvents
-			lastRejected = currentRejected
-			lastArchived = currentArchived
+		if gcPerMin > 60 {
+			log.Printf("⚠️  HIGH GC ACTIVITY: %d garbage collections in last minute!", gcPerMin)
 		}
+
+		if numGoroutines > 1000 {
+			log.Printf("⚠️  HIGH GOROUTINE COUNT: %d goroutines active!", numGoroutines)
+		}
+
+		lastGC = m.NumGC
+		lastEvents = currentEvents
+		lastRejected = currentRejected
+		lastArchived = currentArchived
 	}
 }
 
@@ -948,7 +966,7 @@ Data Structures:
 }
 
 func debugGoroutinesHandler(w http.ResponseWriter, r *http.Request) {
-	buf := make([]byte, 1<<20) // 1MB buffer
+	buf := make([]byte, 1<<20)
 	stackSize := runtime.Stack(buf, true)
 
 	w.Header().Set("Content-Type", "text/plain")
