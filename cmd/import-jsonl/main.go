@@ -3,12 +3,14 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 
 	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/eventstore"
 	"fiatjaf.com/nostr/eventstore/lmdb"
 )
 
@@ -31,7 +33,7 @@ func main() {
 	// events can exceed the default 64KB line limit
 	scanner.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
 
-	var saved, failed uint64
+	var saved, failed, duplicates uint64
 	var line uint64
 	for scanner.Scan() {
 		line++
@@ -52,6 +54,10 @@ func main() {
 		}
 
 		if err := db.SaveEvent(evt); err != nil {
+			if errors.Is(err, eventstore.ErrDupEvent) {
+				duplicates++
+				continue
+			}
 			failed++
 			msg := fmt.Sprintf("line %d (id=%s): save: %v", line, evt.ID, err)
 			if *skipErrors {
@@ -69,5 +75,5 @@ func main() {
 	if err := scanner.Err(); err != nil {
 		log.Fatalf("scan: %v", err)
 	}
-	log.Printf("done: imported %d events, %d failures, %d lines read", saved, failed, line)
+	log.Printf("done: imported %d events, %d duplicates skipped, %d failures, %d lines read", saved, duplicates, failed, line)
 }
