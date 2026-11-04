@@ -260,7 +260,7 @@ func LoadConfig() Config {
 		os.Setenv("REFRESH_INTERVAL_HOURS", "3")
 	}
 
-	refreshInterval, _ := strconv.Atoi(os.Getenv("REFRESH_INTERVAL_HOURS"))
+	refreshInterval := getEnvInt("REFRESH_INTERVAL_HOURS", 1)
 	log.Println("🔄 refresh interval set to", refreshInterval, "hours")
 
 	if os.Getenv("MINIMUM_FOLLOWERS") == "" {
@@ -304,11 +304,14 @@ func LoadConfig() Config {
 		ignoredPubkeys = splitAndTrim(ignoreList)
 	}
 
-	minimumFollowers, _ := strconv.Atoi(os.Getenv("MINIMUM_FOLLOWERS"))
-	maxAgeDays, _ := strconv.Atoi(os.Getenv("MAX_AGE_DAYS"))
-	maxTrustNetwork, _ := strconv.Atoi(os.Getenv("MAX_TRUST_NETWORK"))
-	maxRelays, _ := strconv.Atoi(os.Getenv("MAX_RELAYS"))
-	maxOneHopNetwork, _ := strconv.Atoi(os.Getenv("MAX_ONE_HOP_NETWORK"))
+	minimumFollowers := getEnvInt("MINIMUM_FOLLOWERS", 0)
+	if minimumFollowers == 0 {
+		log.Println("⚠️ MINIMUM_FOLLOWERS=0, events from everyone will be trusted")
+	}
+	maxAgeDays := getEnvInt("MAX_AGE_DAYS", 0)
+	maxTrustNetwork := getEnvInt("MAX_TRUST_NETWORK", 1)
+	maxRelays := getEnvInt("MAX_RELAYS", 1)
+	maxOneHopNetwork := getEnvInt("MAX_ONE_HOP_NETWORK", 1)
 
 	// Parse configurable seed relays, fall back to defaults
 	parsedSeedRelays := defaultSeedRelays
@@ -379,6 +382,17 @@ func getEnv(key string) string {
 	value, exists := os.LookupEnv(key)
 	if !exists {
 		log.Fatalf("Environment variable %s not set", key)
+	}
+	return value
+}
+
+func getEnvInt(key string, minimum int) int {
+	value, err := strconv.Atoi(os.Getenv(key))
+	if err != nil {
+		log.Fatalf("invalid %s value %q: %v", key, os.Getenv(key), err)
+	}
+	if value < minimum {
+		log.Fatalf("%s must be >= %d (got %d)", key, minimum, value)
 	}
 	return value
 }
