@@ -89,7 +89,7 @@ var config Config
 var trustNetwork []string
 var trustNetworkSet = make(map[string]bool) // O(1) lookup
 var seedRelays []string
-var booted bool
+var booted atomic.Bool // reject events until the initial trust network is built
 var oneHopNetwork []string
 var oneHopNetworkSet = make(map[string]bool) // O(1) lookup
 var trustNetworkMap map[string]bool
@@ -117,7 +117,6 @@ var (
 
 func main() {
 	nostr.InfoLogger = log.New(io.Discard, "", 0)
-	booted = false
 	green := "\033[32m"
 	reset := "\033[0m"
 
@@ -142,6 +141,9 @@ func main() {
 	pool = nostr.NewPool()
 	pool.Context = ctx
 	config = LoadConfig()
+	if _, err := nostr.PubKeyFromHex(config.RelayPubkey); err != nil {
+		log.Fatalf("invalid RELAY_PUBKEY %q: %v", config.RelayPubkey, err)
+	}
 
 	relay.Info = &nip11.RelayInformationDocument{
 		Name:        config.RelayName,
@@ -170,18 +172,17 @@ func main() {
 			atomic.AddUint64(&totalEvents, 1)
 
 			pkHex := event.PubKey.Hex()
+			// Events are rejected until the initial trust network is built.
+			// After that the map stays active via atomic swap on rebuilds, so
+			// we never gate against an empty network again.
+			if !booted.Load() {
+				atomic.AddUint64(&rejectedEvents, 1)
+				return true, "trust network is still being built"
+			}
+
 			trustNetworkMutex.RLock()
 			trusted := trustNetworkMap[pkHex]
-			hasNetwork := len(trustNetworkMap) > 0
 			trustNetworkMutex.RUnlock()
-
-			// While the trust network is still being built for the first time (no
-			// list yet), accept everything. On subsequent rebuilds the old map
-			// remains active via atomic swap, so we never reject against an empty
-			// list.
-			if !hasNetwork {
-				return false, ""
-			}
 
 			if !trusted {
 				atomic.AddUint64(&rejectedEvents, 1)
@@ -492,7 +493,7 @@ func refreshProfiles(ctx context.Context) {
 }
 
 func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
-	runTrustNetworkRefresh := func() {
+	runTrustNetworkRefresh := func() int {
 		atomic.AddUint64(&networkRefreshCount, 1)
 		start := time.Now()
 
@@ -514,7 +515,7 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 		ownerPk, err := nostr.PubKeyFromHex(config.RelayPubkey)
 		if err != nil {
 			log.Printf("invalid RELAY_PUBKEY: %v", err)
-			return
+			return 0
 		}
 		filter := nostr.Filter{
 			Authors: []nostr.PubKey{ownerPk},
@@ -632,18 +633,33 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 		relayMutex.RLock()
 		log.Println("🔗 relays discovered:", len(relays))
 		relayMutex.RUnlock()
+
+		return eventCount
 	}
 
 	ticker := time.NewTicker(time.Duration(config.RefreshInterval) * time.Hour)
 	defer ticker.Stop()
 
-	// Run initial refresh
+	// Run initial refresh, retrying until the owner's follow list lands.
+	// On subsequent timer runs the trigger is the tick itself, and callers
+	// discard the return value.
 	log.Println("🚀 performing initial trust network build...")
-	runTrustNetworkRefresh()
-	updateTrustNetworkFilter()
+	for {
+		eventCount := runTrustNetworkRefresh()
+		updateTrustNetworkFilter()
+		if eventCount > 0 {
+			break
+		}
+		log.Println("🌱 no follows fetched yet, retrying in 1 minute...")
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Minute):
+		}
+	}
 
-	// Mark as booted after initial trust network is built
-	booted = true
+	// Mark as booted once an owner follow list has been fetched
+	booted.Store(true)
 	log.Println("✅ trust network initialized, relay is now active")
 
 	deleteOldNotes()
