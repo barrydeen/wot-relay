@@ -210,6 +210,11 @@ func main() {
 	go monitorMemoryUsage()
 	go monitorPerformance()
 
+	indexTmpl, err := template.ParseFiles(config.IndexPath)
+	if err != nil {
+		log.Fatalf("failed to parse INDEX_PATH %q: %v", config.IndexPath, err)
+	}
+
 	mux := relay.Router()
 	static := http.FileServer(http.Dir(config.StaticPath))
 
@@ -220,7 +225,6 @@ func main() {
 	mux.HandleFunc("GET /debug/goroutines", debugGoroutinesHandler)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		tmpl := template.Must(template.ParseFiles(os.Getenv("INDEX_PATH")))
 		data := struct {
 			RelayName        string
 			RelayPubkey      string
@@ -232,9 +236,9 @@ func main() {
 			RelayDescription: config.RelayDescription,
 			RelayURL:         config.RelayURL,
 		}
-		err := tmpl.Execute(w, data)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if err := indexTmpl.Execute(w, data); err != nil {
+			log.Printf("failed to render index template: %v", err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
 		}
 	})
 
@@ -247,7 +251,7 @@ func main() {
 	log.Printf("   http://localhost:%s/debug/pprof/ (CPU/memory profiling)", port)
 	log.Printf("   http://localhost:%s/debug/stats (application stats)", port)
 	log.Printf("   http://localhost:%s/debug/goroutines (goroutine info)", port)
-	err := http.ListenAndServe(":"+port, relay)
+	err = http.ListenAndServe(":"+port, relay)
 	if err != nil {
 		log.Fatal(err)
 	}
