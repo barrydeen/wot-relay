@@ -2,7 +2,9 @@
 
 WOT Relay is a Nostr relay that saves all the notes that people you follow, and people they follow are posting. It's built on the [Khatru](https://khatru.nostr.technology) framework.
 
-# Available Relays
+**Status:** v0.2.1 — latest release (2026-04-22).
+
+## Available Relays
 
 Don't want to run the relay, just want to connect to some? Here are some available relays:
 
