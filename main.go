@@ -21,6 +21,7 @@ import (
 	"fiatjaf.com/nostr/khatru"
 	"fiatjaf.com/nostr/khatru/policies"
 	"fiatjaf.com/nostr/nip11"
+	"fiatjaf.com/nostr/nip19"
 	"github.com/joho/godotenv"
 )
 
@@ -163,11 +164,31 @@ func main() {
 	}
 	relay.UseEventstore(db, 500)
 
+	fund, err := newFunding(loadFundingConfig(config), relay, db, pool)
+	if err != nil {
+		log.Fatalf("funding config: %v", err)
+	}
+	if fund != nil {
+		relay.OnEventSaved = fund.onEventSaved
+		relay.OverwriteRelayInformation = fund.overwriteRelayInformation
+	}
+
 	relay.OnEvent = policies.SeqEvent(
 		policies.RejectEventsWithBase64Media,
 		policies.EventIPRateLimiter(5, time.Minute*1, 30),
 		func(ctx context.Context, event nostr.Event) (bool, string) {
 			atomic.AddUint64(&totalEvents, 1)
+
+			// zap receipts for the monthly funding goal are always welcome,
+			// they come from the lightning provider which is not in the WoT
+			if _, ok := fund.isGoalZapReceipt(event); ok {
+				return false, ""
+			}
+			// everything else is refused while the monthly goal is unmet
+			if fund.locked() {
+				atomic.AddUint64(&rejectedEvents, 1)
+				return true, fund.rejectReason()
+			}
 
 			pkHex := event.PubKey.Hex()
 			trustNetworkMutex.RLock()
@@ -209,8 +230,14 @@ func main() {
 	go refreshTrustNetwork(ctx, relay)
 	go monitorMemoryUsage()
 	go monitorPerformance()
+	if fund != nil {
+		go fund.run(ctx)
+	}
 
 	mux := relay.Router()
+	if fund != nil {
+		fund.registerRoutes(mux)
+	}
 	static := http.FileServer(http.Dir(config.StaticPath))
 
 	mux.Handle("GET /static/", http.StripPrefix("/static/", static))
@@ -226,11 +253,23 @@ func main() {
 			RelayPubkey      string
 			RelayDescription string
 			RelayURL         string
+			FundingEnabled   bool
+			FundingGoalSats  string
+			FundingNpub      string
+			FundingLightning string
+			FundingGraceDays int
 		}{
 			RelayName:        config.RelayName,
 			RelayPubkey:      config.RelayPubkey,
 			RelayDescription: config.RelayDescription,
 			RelayURL:         config.RelayURL,
+		}
+		if fund != nil {
+			data.FundingEnabled = true
+			data.FundingGoalSats = formatSats(fund.cfg.GoalSats)
+			data.FundingNpub = nip19.EncodeNpub(fund.pk)
+			data.FundingLightning = fund.cfg.LightningAddress
+			data.FundingGraceDays = fund.cfg.GraceDays
 		}
 		err := tmpl.Execute(w, data)
 		if err != nil {
@@ -247,8 +286,7 @@ func main() {
 	log.Printf("   http://localhost:%s/debug/pprof/ (CPU/memory profiling)", port)
 	log.Printf("   http://localhost:%s/debug/stats (application stats)", port)
 	log.Printf("   http://localhost:%s/debug/goroutines (goroutine info)", port)
-	err := http.ListenAndServe(":"+port, relay)
-	if err != nil {
+	if err := http.ListenAndServe(":"+port, relay); err != nil {
 		log.Fatal(err)
 	}
 }

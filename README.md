@@ -234,6 +234,51 @@ Once everything is set up, the relay will be running on `localhost:3334`.
 http://localhost:3334
 ```
 
+## Monthly zap funding goal (optional)
+
+The relay can run as a **community funded relay**. Instead of charging every user, it sets a monthly
+goal (say 100,000 sats). Until the web of trust has zapped that amount, the relay refuses all writes
+and tells clients it is `payment_required`. As soon as the goal is met, everyone in the web of trust
+can write for free until the 1st of the next month, when the goal resets.
+
+How it works:
+
+- On boot (and on the 1st of every month) the relay publishes a [NIP-75](https://github.com/nostr-protocol/nips/blob/master/75.md)
+  zap goal (kind `9041`) signed by a dedicated **funding identity** key, plus a kind `0` profile for
+  that key carrying your lightning address. The goal is broadcast to the seed relays so it shows up
+  in clients that render zap goals (Amethyst does).
+- People zap the goal from the relay's web page (QR code, `lightning:` link, WebLN, or signed with a
+  NIP-07 extension so the zap is attributed to them) or from any nostr client.
+- The relay accepts kind `9735` zap receipts for the goal from your lightning address's LNURL provider
+  (the `nostrPubkey` it advertises), verifies the embedded zap request, and tallies them. It also
+  follows the seed relays for receipts in case the provider could not deliver them directly.
+- While the goal is unmet (after the grace period) every `EVENT` is rejected with a `blocked:` reason
+  pointing at the web page, and the NIP-11 document carries `limitation.payment_required: true`,
+  `fees.subscription` and `payments_url`. Once funded, `payment_required` flips to `false` and the fees
+  disappear. `restricted_writes` is always `true` because this is a web-of-trust relay. Clients cache
+  NIP-11, so the change can take a few minutes to show up in-app. Reads are never restricted.
+- `GET /funding.json` exposes the live state (goal, raised, locked, period, goal `nevent`, top
+  supporters). `POST /funding/invoice` with `{"amount_sats": 2100, "comment": "..."}` returns a bolt11
+  invoice for a zap to the goal; pass a browser-signed kind `9734` as `zap_request` to attribute it.
+
+Configuration (all optional, the feature is off unless `FUNDING_GOAL_SATS` is set):
+
+```bash
+FUNDING_GOAL_SATS=100000                    # sats to raise each month; 0/unset disables the feature
+FUNDING_SECRET_KEY="<hex or nsec>"          # a NEW key for the funding identity, never your own nsec
+FUNDING_LIGHTNING_ADDRESS="you@getalby.com" # must support nostr zaps (allowsNostr=true)
+FUNDING_GRACE_DAYS=3                        # writes stay open this many days into each month (default 3)
+FUNDING_TIMEZONE="UTC"                      # IANA zone for month boundaries (default UTC)
+FUNDING_NAME=""                             # profile name of the funding identity (default "<RELAY_NAME> Fund")
+FUNDING_RELAYS=""                           # relays receipts are delivered to / tallied from (default: ditto.pub, primal, damus, nos.lol)
+```
+
+Generate a fresh key for `FUNDING_SECRET_KEY`, for example with `openssl rand -hex 32` or `nak key generate`.
+The relay logs the resulting npub on boot. The zaps land in the wallet behind
+`FUNDING_LIGHTNING_ADDRESS`; the relay never touches funds, it only counts receipts.
+
+Surplus does not carry over: every month starts again at zero.
+
 ## Migrating from Badger to LMDB
 
 Older versions of wot-relay stored events in a Badger database. The relay now

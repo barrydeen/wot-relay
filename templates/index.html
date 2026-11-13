@@ -1,12 +1,15 @@
 <!DOCTYPE html>
 <html lang="en">
   <head>
-    <meta name="theme-color" content="#ffffff" />
+    <meta name="theme-color" content="#111827" />
     <meta charset="UTF-8" />
     <link rel="icon" href="/favicon.ico" type="image/x-icon" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>{{.RelayName}}</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    {{if .FundingEnabled}}
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+    {{end}}
     <style>
       @import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap");
       body {
@@ -15,12 +18,21 @@
         display: flex;
         flex-direction: column;
       }
+      #qr img, #qr canvas { margin: 0 auto; }
+      .bar { transition: width 0.6s ease; }
+      #zap-btn { min-width: 6.5rem; white-space: nowrap; }
+      .spinner {
+        display: inline-block; width: 1em; height: 1em; vertical-align: -0.15em;
+        border: 2px solid rgba(255,255,255,0.35); border-top-color: #fff; border-radius: 50%;
+        animation: spin 0.7s linear infinite;
+      }
+      @keyframes spin { to { transform: rotate(360deg); } }
     </style>
   </head>
   <body class="bg-gray-900 text-white">
-    <div class="flex-grow flex flex-col justify-center items-center px-4">
+    <div class="flex-grow flex flex-col justify-center items-center px-4 py-12">
       <!-- Container -->
-      <div class="text-center max-w-2xl">
+      <div class="text-center max-w-2xl w-full">
         <!-- Heading (Relay Name) -->
         <h1 class="text-5xl md:text-6xl font-bold text-purple-400 mb-6">
           {{.RelayName}}
@@ -38,6 +50,86 @@
         >
           {{.RelayURL}}
         </a>
+
+        {{if .FundingEnabled}}
+        <!-- ===================== Monthly funding goal ===================== -->
+        <section id="funding" class="mt-12 text-left overflow-hidden bg-gray-800 rounded-2xl p-6 md:p-8 shadow-xl border border-gray-700">
+          <div class="flex flex-wrap items-center justify-between gap-3 mb-2">
+            <h2 class="text-2xl font-bold text-purple-300">⚡ Monthly funding goal</h2>
+            <span id="status-pill" class="text-sm font-semibold px-3 py-1 rounded-full bg-gray-700 text-gray-300">loading…</span>
+          </div>
+          <p class="text-gray-400 text-sm mb-5">
+            This relay is free and community funded. Each month the web of trust needs to raise
+            <span class="text-purple-300 font-semibold">{{.FundingGoalSats}} sats</span>.
+            Until the goal is met, nobody can write to the relay
+            {{if gt .FundingGraceDays 0}}(after a {{.FundingGraceDays}}-day grace period at the start of the month){{end}}.
+            One person can cover it all, or everyone can chip in. It resets on the 1st.
+          </p>
+
+          <!-- progress -->
+          <div class="w-full bg-gray-700 rounded-full h-5 overflow-hidden">
+            <div id="bar" class="bar h-5 bg-gradient-to-r from-purple-500 to-fuchsia-400 rounded-full" style="width:0%"></div>
+          </div>
+          <div class="flex justify-between text-sm mt-2 text-gray-300">
+            <span><span id="raised" class="font-semibold text-white">0</span> / <span id="goal">{{.FundingGoalSats}}</span> sats</span>
+            <span><span id="percent">0</span>% · <span id="zapcount">0</span> zaps</span>
+          </div>
+          <p id="period-line" class="text-xs text-gray-500 mt-1"></p>
+
+          <!-- zap form -->
+          <div id="zap-form" class="mt-6">
+            <div class="flex flex-wrap gap-2 mb-3" id="presets">
+              <button data-sats="1000" class="preset px-4 py-2 rounded-lg bg-gray-700 hover:bg-purple-600 transition">1k</button>
+              <button data-sats="5000" class="preset px-4 py-2 rounded-lg bg-gray-700 hover:bg-purple-600 transition">5k</button>
+              <button data-sats="21000" class="preset px-4 py-2 rounded-lg bg-gray-700 hover:bg-purple-600 transition">21k</button>
+              <button data-sats="100000" class="preset px-4 py-2 rounded-lg bg-gray-700 hover:bg-purple-600 transition">100k</button>
+            </div>
+            <div class="flex flex-col md:flex-row gap-2">
+              <input id="amount" type="number" min="1" placeholder="amount in sats" value="5000"
+                class="flex-1 min-w-0 rounded-lg bg-gray-900 border border-gray-600 px-4 py-2 focus:outline-none focus:border-purple-400" />
+              <input id="comment" type="text" maxlength="280" placeholder="comment (optional)"
+                class="flex-1 min-w-0 rounded-lg bg-gray-900 border border-gray-600 px-4 py-2 focus:outline-none focus:border-purple-400" />
+              <button id="zap-btn" class="shrink-0 px-6 py-2 rounded-lg bg-purple-600 hover:bg-purple-500 font-semibold transition">Zap ⚡</button>
+            </div>
+            <label id="nip07-row" class="hidden items-center gap-2 mt-3 text-sm text-gray-300 cursor-pointer">
+              <input id="nip07" type="checkbox" class="accent-purple-500" checked />
+              Sign the zap with my nostr extension so it shows up under my name
+            </label>
+            <p id="form-error" class="text-red-400 text-sm mt-2 hidden"></p>
+          </div>
+
+          <!-- invoice -->
+          <div id="invoice-box" class="hidden mt-6 bg-gray-900 rounded-xl p-5 border border-gray-700 text-center">
+            <p class="text-gray-300 mb-3">Pay <span id="inv-amount" class="font-semibold text-white"></span> sats to zap the goal</p>
+            <div id="qr" class="bg-white p-3 rounded-lg inline-block"></div>
+            <div class="flex flex-wrap justify-center gap-2 mt-4">
+              <a id="ln-link" href="#" class="px-4 py-2 rounded-lg bg-purple-600 hover:bg-purple-500 transition">Open in wallet</a>
+              <button id="webln-btn" class="hidden px-4 py-2 rounded-lg bg-yellow-500 text-black hover:bg-yellow-400 transition">Pay with WebLN</button>
+              <button id="copy-btn" class="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 transition">Copy invoice</button>
+              <button id="cancel-btn" class="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 transition">Cancel</button>
+            </div>
+            <p id="inv-status" class="text-sm text-gray-400 mt-3">Waiting for payment…</p>
+            <textarea id="pr" readonly class="w-full mt-3 text-xs bg-gray-800 text-gray-400 rounded p-2 h-16 break-all"></textarea>
+          </div>
+
+          <div id="thanks" class="hidden mt-6 bg-purple-900/40 border border-purple-500 rounded-xl p-5 text-center">
+            <p class="text-2xl">🎉 Thank you for zapping the relay!</p>
+            <p class="text-gray-300 text-sm mt-1">Your zap has been counted toward this month's goal.</p>
+          </div>
+
+          <!-- contributors -->
+          <div id="contrib-wrap" class="hidden mt-8">
+            <h3 class="text-lg font-semibold text-purple-300 mb-2">Top supporters this month</h3>
+            <ul id="contributors" class="divide-y divide-gray-700 text-sm"></ul>
+          </div>
+
+          <p class="text-xs text-gray-500 mt-6 break-words">
+            Zaps go to <span class="text-gray-300 break-all">{{.FundingLightning}}</span>. You can also zap the goal from any nostr client:
+            <a id="goal-link" href="#" class="text-purple-300 underline">open the goal</a> ·
+            funding identity <a href="nostr:{{.FundingNpub}}" class="text-purple-300 underline break-all">{{.FundingNpub}}</a>
+          </p>
+        </section>
+        {{end}}
       </div>
     </div>
 
@@ -67,5 +159,197 @@
         >
       </p>
     </footer>
+
+    {{if .FundingEnabled}}
+    <script>
+      (function () {
+        const $ = (id) => document.getElementById(id);
+        const fmt = (n) => Number(n).toLocaleString("en-US");
+        const RELAY_URL = {{.RelayURL}};
+        let status = null;
+        let pollTimer = null;
+        let watching = null; // { baselineZapCount }
+
+        function dateStr(unix) {
+          return new Date(unix * 1000).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
+        }
+
+        function render(s) {
+          status = s;
+          $("raised").textContent = fmt(s.raised_sats);
+          $("goal").textContent = fmt(s.goal_sats);
+          $("percent").textContent = s.percent;
+          $("zapcount").textContent = s.zap_count;
+          $("bar").style.width = Math.max(s.percent, s.raised_sats > 0 ? 2 : 0) + "%";
+
+          const pill = $("status-pill");
+          pill.className = "text-sm font-semibold px-3 py-1 rounded-full ";
+          if (s.funded) {
+            pill.textContent = "🔓 Goal met · relay is writable";
+            pill.className += "bg-green-900 text-green-300";
+          } else if (s.in_grace) {
+            pill.textContent = "⏳ Grace period · writable until " + dateStr(s.grace_until);
+            pill.className += "bg-yellow-900 text-yellow-300";
+          } else if (s.locked) {
+            pill.textContent = "🔒 Locked · writes open when funded";
+            pill.className += "bg-red-900 text-red-300";
+          } else {
+            pill.textContent = "starting up…";
+            pill.className += "bg-gray-700 text-gray-300";
+          }
+
+          $("period-line").textContent =
+            "Goal for " + new Date(s.period_start * 1000).toLocaleString(undefined, { month: "long", year: "numeric" }) +
+            " · resets " + dateStr(s.period_end) + " (" + s.timezone + ")";
+
+          if (s.goal_nevent) $("goal-link").href = "nostr:" + s.goal_nevent;
+
+          const list = $("contributors");
+          list.innerHTML = "";
+          if (s.contributors && s.contributors.length) {
+            $("contrib-wrap").classList.remove("hidden");
+            for (const c of s.contributors) {
+              const li = document.createElement("li");
+              li.className = "flex items-center justify-between py-2 gap-3";
+              const left = document.createElement("div");
+              left.className = "flex items-center gap-2 min-w-0";
+              if (c.picture) {
+                const img = document.createElement("img");
+                img.src = c.picture; img.className = "w-7 h-7 rounded-full object-cover"; img.loading = "lazy";
+                img.onerror = () => img.remove();
+                left.appendChild(img);
+              }
+              const name = document.createElement("span");
+              name.className = "truncate";
+              name.textContent = c.name || (c.npub.slice(0, 12) + "…" + c.npub.slice(-6));
+              if (!c.anonymous) {
+                const a = document.createElement("a");
+                a.href = "nostr:" + c.npub; a.className = "hover:text-purple-300"; a.appendChild(name);
+                left.appendChild(a);
+              } else {
+                left.appendChild(name);
+              }
+              const right = document.createElement("span");
+              right.className = "text-purple-300 font-semibold whitespace-nowrap";
+              right.textContent = fmt(c.sats) + " sats";
+              li.appendChild(left); li.appendChild(right);
+              list.appendChild(li);
+            }
+          } else {
+            $("contrib-wrap").classList.add("hidden");
+          }
+
+          if (watching && s.zap_count > watching.baselineZapCount) {
+            watching = null;
+            $("invoice-box").classList.add("hidden");
+            $("thanks").classList.remove("hidden");
+            schedule(15000);
+          }
+        }
+
+        async function refresh() {
+          try {
+            const r = await fetch("/funding.json", { cache: "no-store" });
+            if (r.ok) render(await r.json());
+          } catch (e) { /* ignore transient errors */ }
+        }
+
+        function schedule(ms) {
+          clearTimeout(pollTimer);
+          pollTimer = setTimeout(async () => { await refresh(); schedule(watching ? 3000 : 15000); }, ms);
+        }
+
+        function showError(msg) {
+          const el = $("form-error");
+          el.textContent = msg; el.classList.remove("hidden");
+        }
+
+        async function buildNip07ZapRequest(sats, comment) {
+          // same list the server puts in its own zap requests: relays the
+          // lightning provider can actually reach and the relay tallies from
+          const relays = (status && status.relays && status.relays.length) ? status.relays : [RELAY_URL];
+          const evt = {
+            kind: 9734,
+            created_at: Math.floor(Date.now() / 1000),
+            content: comment || "",
+            tags: [
+              ["relays", ...relays],
+              ["amount", String(sats * 1000)],
+              ["p", status.funding_pubkey],
+              ["e", status.goal_event_id],
+            ],
+          };
+          return await window.nostr.signEvent(evt);
+        }
+
+        async function zap() {
+          $("form-error").classList.add("hidden");
+          $("thanks").classList.add("hidden");
+          const sats = parseInt($("amount").value, 10);
+          const comment = $("comment").value.trim();
+          if (!sats || sats < 1) return showError("Enter an amount in sats.");
+          if (!status || !status.goal_event_id) return showError("The goal is still starting up, try again in a moment.");
+
+          const btn = $("zap-btn");
+          btn.disabled = true; btn.innerHTML = '<span class="spinner"></span>';
+          try {
+            const body = { amount_sats: sats, comment };
+            if (window.nostr && $("nip07").checked) {
+              try { body.zap_request = await buildNip07ZapRequest(sats, comment); }
+              catch (e) { showError("Extension signing was rejected, sending an anonymous zap instead."); }
+            }
+            const r = await fetch("/funding/invoice", {
+              method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+            });
+            const data = await r.json();
+            if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+            showInvoice(data.pr, sats);
+          } catch (e) {
+            showError(e.message || String(e));
+          } finally {
+            btn.disabled = false; btn.innerHTML = "Zap ⚡";
+          }
+        }
+
+        function showInvoice(pr, sats) {
+          $("inv-amount").textContent = fmt(sats);
+          $("pr").value = pr;
+          $("ln-link").href = "lightning:" + pr;
+          $("qr").innerHTML = "";
+          new QRCode($("qr"), { text: "lightning:" + pr.toUpperCase(), width: 220, height: 220, correctLevel: QRCode.CorrectLevel.L });
+          $("inv-status").textContent = "Waiting for payment…";
+          $("invoice-box").classList.remove("hidden");
+          $("webln-btn").classList.toggle("hidden", !window.webln);
+          $("webln-btn").onclick = async () => {
+            try {
+              await window.webln.enable();
+              $("inv-status").textContent = "Paying with WebLN…";
+              await window.webln.sendPayment(pr);
+              $("inv-status").textContent = "Paid! Waiting for the zap receipt…";
+            } catch (e) { $("inv-status").textContent = "WebLN: " + (e.message || e); }
+          };
+          watching = { baselineZapCount: status ? status.zap_count : 0 };
+          schedule(3000);
+          $("invoice-box").scrollIntoView({ behavior: "smooth", block: "center" });
+        }
+
+        $("zap-btn").addEventListener("click", zap);
+        $("copy-btn").addEventListener("click", async () => {
+          try { await navigator.clipboard.writeText($("pr").value); $("copy-btn").textContent = "Copied!"; }
+          catch (e) { $("pr").select(); }
+          setTimeout(() => ($("copy-btn").textContent = "Copy invoice"), 1500);
+        });
+        $("cancel-btn").addEventListener("click", () => { watching = null; $("invoice-box").classList.add("hidden"); schedule(15000); });
+        for (const b of document.querySelectorAll(".preset")) {
+          b.addEventListener("click", () => { $("amount").value = b.dataset.sats; });
+        }
+        const showNip07 = () => { if (window.nostr) { $("nip07-row").classList.remove("hidden"); $("nip07-row").classList.add("flex"); } };
+        showNip07();
+        window.addEventListener("load", showNip07);
+
+        refresh().then(() => schedule(15000));
+      })();
+    </script>
+    {{end}}
   </body>
 </html>
