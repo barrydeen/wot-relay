@@ -217,7 +217,6 @@ func main() {
 	mux.Handle("GET /favicon.ico", http.StripPrefix("/", static))
 
 	mux.HandleFunc("GET /debug/stats", debugStatsHandler)
-	mux.HandleFunc("GET /debug/goroutines", debugGoroutinesHandler)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		tmpl := template.Must(template.ParseFiles(os.Getenv("INDEX_PATH")))
@@ -243,10 +242,13 @@ func main() {
 		port = "3334"
 	}
 	log.Printf("🎉 relay running on port :%s", port)
-	log.Println("🔍 debug endpoints available at:")
-	log.Printf("   http://localhost:%s/debug/pprof/ (CPU/memory profiling)", port)
-	log.Printf("   http://localhost:%s/debug/stats (application stats)", port)
-	log.Printf("   http://localhost:%s/debug/goroutines (goroutine info)", port)
+	go func() {
+		// pprof handlers register on DefaultServeMux, which the relay mux
+		// does not serve; give them a localhost-only listener
+		log.Println("🔍 pprof available at http://localhost:6060/debug/pprof/")
+		log.Println(http.ListenAndServe("127.0.0.1:6060", nil))
+	}()
+	log.Printf("🔍 application stats available at http://localhost:%s/debug/stats", port)
 	err := http.ListenAndServe(":"+port, relay)
 	if err != nil {
 		log.Fatal(err)
@@ -914,6 +916,23 @@ func monitorPerformance() {
 
 // Debug handlers
 func debugStatsHandler(w http.ResponseWriter, r *http.Request) {
+	// writers hold these locks, so read under them
+	relayMutex.RLock()
+	relayCount := len(relays)
+	relayMutex.RUnlock()
+
+	trustNetworkMutex.RLock()
+	trustNetworkCount := len(trustNetwork)
+	trustNetworkMutex.RUnlock()
+
+	oneHopMutex.RLock()
+	oneHopCount := len(oneHopNetwork)
+	oneHopMutex.RUnlock()
+
+	followerMutex.RLock()
+	followerCount := len(pubkeyFollowerCount)
+	followerMutex.RUnlock()
+
 	var m runtime.MemStats
 	runtime.ReadMemStats(&m)
 
@@ -955,20 +974,12 @@ Data Structures:
 		atomic.LoadUint64(&untrustedNotes),
 		atomic.LoadUint64(&profileRefreshCount),
 		atomic.LoadUint64(&networkRefreshCount),
-		len(relays),
-		len(trustNetwork),
-		len(oneHopNetwork),
-		len(pubkeyFollowerCount),
+		relayCount,
+		trustNetworkCount,
+		oneHopCount,
+		followerCount,
 	)
 
 	w.Header().Set("Content-Type", "text/plain")
 	w.Write([]byte(stats))
-}
-
-func debugGoroutinesHandler(w http.ResponseWriter, r *http.Request) {
-	buf := make([]byte, 1<<20)
-	stackSize := runtime.Stack(buf, true)
-
-	w.Header().Set("Content-Type", "text/plain")
-	w.Write(buf[:stackSize])
 }
