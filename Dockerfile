@@ -1,5 +1,5 @@
 # Use Golang image based on Debian Bookworm
-FROM golang:bookworm
+FROM golang:trixie
 
 # Set the working directory within the container
 WORKDIR /app
