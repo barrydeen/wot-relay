@@ -273,10 +273,16 @@ old store and re-imported into a fresh LMDB store.
    ```
 7. Start the relay as normal. `DB_PATH` now points at the LMDB directory.
 
+> **Note:** `import-jsonl` stores every parsed line as-is — it does **not**
+> re-check event IDs or signatures (`nostr.Event`'s JSON parser is a plain
+> decoder; the relay's websocket layer does that check at runtime instead).
+> Only import JSONL exports from sources you trust, like your own
+> `export-badger` output above.
+
 ### Migrating with Docker
 
 If you run wot-relay via Docker Compose, you don't need Go installed on the
-host — the steps above can be run inside the `golang:bookworm` image against
+host — the steps above can be run inside the `golang:trixie` image against
 the same `./db` bind mount your compose file already uses.
 
 1. Stop the relay:
@@ -287,7 +293,7 @@ the same `./db` bind mount your compose file already uses.
 2. Export the Badger DB to JSONL:
 
    ```bash
-   docker run --rm -v "$PWD:/src" -w /src golang:bookworm sh -c \
+   docker run --rm -v "$PWD:/src" -w /src golang:trixie sh -c \
        "cd tools/export-badger && go build -o /tmp/export-badger . && /tmp/export-badger -db /src/db > /src/events.jsonl"
    ```
 3. Move the old database aside:
@@ -298,7 +304,7 @@ the same `./db` bind mount your compose file already uses.
 4. Import the JSONL into a fresh LMDB directory:
 
    ```bash
-   docker run --rm -v "$PWD:/src" -w /src golang:bookworm sh -c \
+   docker run --rm -v "$PWD:/src" -w /src golang:trixie sh -c \
        "go build -o /tmp/import-jsonl ./cmd/import-jsonl && /tmp/import-jsonl -db /src/db < /src/events.jsonl"
    ```
 5. Rebuild and start the relay:
