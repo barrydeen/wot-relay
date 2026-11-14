@@ -175,6 +175,33 @@ Follow the instructions to generate the certificate.
 
 Once everything is set up, the relay will be running on `localhost:3334` or your domain name if you set up nginx.
 
+## Optional WoT Relay Manager
+
+Relay operators who want a lightweight local dashboard can use the optional
+[WoT Relay Manager](https://github.com/snurge/wot-relay-manager).
+
+The manager is intended as an operator convenience tool and is not required to
+run `wot-relay`. It provides a web UI for relay stats, configuration
+visibility/editing, recent logs, and controlled service restart.
+
+For security, the manager is designed to bind to `127.0.0.1` and be accessed
+over an SSH tunnel. It should not expose an admin interface publicly.
+
+Example SSH tunnel:
+
+```bash
+ssh -N -o ServerAliveInterval=60 -L 4781:127.0.0.1:4781 root@YOUR_RELAY_HOST
+```
+
+Then open the manager locally:
+
+```bash
+http://127.0.0.1:4781
+```
+
+This is intended as an operator convenience tool, not a change to core relay
+behaviour.
+
 ## Start the Project with Docker Compose
 
 To start the project using Docker Compose, follow these steps:
