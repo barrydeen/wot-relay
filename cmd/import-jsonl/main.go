@@ -42,6 +42,8 @@ func main() {
 			continue
 		}
 
+		// Parsed but not validated: IDs and signatures are stored as given.
+		// Only import exports from a source you trust.
 		var evt nostr.Event
 		if err := json.Unmarshal(b, &evt); err != nil {
 			failed++
