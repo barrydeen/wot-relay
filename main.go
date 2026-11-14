@@ -239,6 +239,11 @@ func main() {
 		go fund.run(ctx)
 	}
 
+	indexTmpl, err := template.ParseFiles(config.IndexPath)
+	if err != nil {
+		log.Fatalf("failed to parse INDEX_PATH %q: %v", config.IndexPath, err)
+	}
+
 	mux := relay.Router()
 	if fund != nil {
 		fund.registerRoutes(mux)
@@ -252,7 +257,6 @@ func main() {
 	mux.HandleFunc("GET /debug/goroutines", debugGoroutinesHandler)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		tmpl := template.Must(template.ParseFiles(os.Getenv("INDEX_PATH")))
 		data := struct {
 			RelayName        string
 			RelayPubkey      string
@@ -276,9 +280,9 @@ func main() {
 			data.FundingLightning = fund.cfg.LightningAddress
 			data.FundingGraceDays = fund.cfg.GraceDays
 		}
-		err := tmpl.Execute(w, data)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if err := indexTmpl.Execute(w, data); err != nil {
+			log.Printf("failed to render index template: %v", err)
+			http.Error(w, "internal server error", http.StatusInternalServerError)
 		}
 	})
 
