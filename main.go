@@ -150,6 +150,14 @@ func main() {
 		Icon:        config.RelayIcon,
 		Software:    "https://github.com/barrydeen/wot-relay",
 		Version:     version,
+		Limitation: &nip11.RelayLimitationDocument{
+			MaxMessageLength: 512000,
+			MaxLimit:         500,
+			DefaultLimit:     500,
+			AuthRequired:     false,
+			PaymentRequired:  false,
+			RestrictedWrites: true,
+		},
 	}
 	if pk, err := nostr.PubKeyFromHex(config.RelayPubkey); err == nil {
 		relay.Info.PubKey = &pk
