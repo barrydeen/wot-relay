@@ -35,7 +35,6 @@ COPY --from=builder /app/main /app/
 
 # Copy any necessary files like templates, static assets, etc.
 COPY --from=builder /app/templates /app/templates
-COPY --from=builder /app/.env /app/
 
 # Expose the port that the application will run on
 EXPOSE 3334
