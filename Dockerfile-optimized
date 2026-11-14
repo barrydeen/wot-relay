@@ -1,5 +1,5 @@
 # Stage 1: Build the Go application
-FROM golang:bookworm AS builder
+FROM golang:trixie AS builder
 
 # Set the working directory within the container
 WORKDIR /app
@@ -25,7 +25,7 @@ RUN touch .env
 RUN go build -o main .
 
 # Stage 2: Create a minimal image to run the Go application
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 # Set the working directory within the container
 WORKDIR /app
