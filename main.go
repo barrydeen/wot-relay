@@ -22,6 +22,7 @@ import (
 	"fiatjaf.com/nostr/khatru/policies"
 	"fiatjaf.com/nostr/nip11"
 	"fiatjaf.com/nostr/nip19"
+	"fiatjaf.com/nostr/nip65"
 	"github.com/joho/godotenv"
 )
 
@@ -88,7 +89,8 @@ var config Config
 var trustNetwork []string
 var trustNetworkSet = make(map[string]bool) // O(1) lookup
 var seedRelays []string
-var booted bool
+var booted atomic.Bool            // reject events until the initial trust network is built
+var fallbackAcceptAll atomic.Bool // fallback to accept-all if boot deadline expires without owner follows
 var oneHopNetwork []string
 var oneHopNetworkSet = make(map[string]bool) // O(1) lookup
 var trustNetworkMap map[string]bool
@@ -115,7 +117,6 @@ var (
 
 func main() {
 	nostr.InfoLogger = log.New(io.Discard, "", 0)
-	booted = false
 	green := "\033[32m"
 	reset := "\033[0m"
 
@@ -140,6 +141,9 @@ func main() {
 	pool = nostr.NewPool()
 	pool.Context = ctx
 	config = LoadConfig()
+	if _, err := nostr.PubKeyFromHex(config.RelayPubkey); err != nil {
+		log.Fatalf("invalid RELAY_PUBKEY %q: %v", config.RelayPubkey, err)
+	}
 
 	relay.Info = &nip11.RelayInformationDocument{
 		Name:        config.RelayName,
@@ -195,27 +199,13 @@ func main() {
 				return true, fund.rejectReason()
 			}
 
-			pkHex := event.PubKey.Hex()
-			trustNetworkMutex.RLock()
-			trusted := trustNetworkMap[pkHex]
-			hasNetwork := len(trustNetworkMap) > 0
-			trustNetworkMutex.RUnlock()
-
-			// While the trust network is still being built for the first time (no
-			// list yet), accept everything. On subsequent rebuilds the old map
-			// remains active via atomic swap, so we never reject against an empty
-			// list.
-			if !hasNetwork {
-				return false, ""
-			}
-
-			if !trusted {
+			// Pre-boot events are rejected until the initial trust network builds
+			// (or the boot deadline falls back to accept-all). Post-boot, the map
+			// stays active via atomic swap on rebuilds so normal operation never
+			// gates against an empty network.
+			if reject, reason := checkWoTEvent(event); reject {
 				atomic.AddUint64(&rejectedEvents, 1)
-				return true, "not in web of trust"
-			}
-			if event.Kind == nostr.KindEncryptedDirectMessage {
-				atomic.AddUint64(&rejectedEvents, 1)
-				return true, "only gift wrapped DMs are allowed"
+				return true, reason
 			}
 
 			return false, ""
@@ -555,8 +545,100 @@ func refreshProfiles(ctx context.Context) {
 	log.Printf("👤 profiles refreshed: %d profiles in %v", len(currentTrustNetwork), duration)
 }
 
+const maxBootRetries = 10
+
+func checkWoTEvent(event nostr.Event) (bool, string) {
+	if !booted.Load() {
+		return true, "trust network is still being built"
+	}
+	if fallbackAcceptAll.Load() {
+		return false, ""
+	}
+
+	pkHex := event.PubKey.Hex()
+	trustNetworkMutex.RLock()
+	trusted := trustNetworkMap[pkHex]
+	trustNetworkMutex.RUnlock()
+
+	if !trusted {
+		return true, "not in web of trust"
+	}
+	if event.Kind == nostr.KindEncryptedDirectMessage {
+		return true, "only gift wrapped DMs are allowed"
+	}
+	return false, ""
+}
+
+func ownerWriteRelaysFromEvents(events []nostr.Event) []string {
+	var latest *nostr.Event
+	for i := range events {
+		if latest == nil || events[i].CreatedAt > latest.CreatedAt {
+			latest = &events[i]
+		}
+	}
+	if latest == nil {
+		return nil
+	}
+	_, writeRelays := nip65.ParseRelayList(*latest)
+	seen := make(map[string]bool, len(writeRelays))
+	unique := make([]string, 0, len(writeRelays))
+	for _, u := range writeRelays {
+		if !seen[u] {
+			seen[u] = true
+			unique = append(unique, u)
+		}
+	}
+	return unique
+}
+
+func fetchOwnerFollowEvents(ctx context.Context, ownerPk nostr.PubKey) []nostr.Event {
+	filter := nostr.Filter{
+		Authors: []nostr.PubKey{ownerPk},
+		Kinds:   []nostr.Kind{nostr.KindFollowList},
+	}
+
+	log.Println("🔍 fetching owner's follows")
+	timeoutCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	var followEvents []nostr.Event
+	for ev := range pool.FetchMany(timeoutCtx, seedRelays, filter, nostr.SubscriptionOptions{}) {
+		followEvents = append(followEvents, ev.Event)
+	}
+	if len(followEvents) > 0 {
+		return followEvents
+	}
+
+	// Fall back to the owner's NIP-65 write relays if seed relays lack their kind-3
+	log.Println("🔍 no owner follow list on seed relays, checking NIP-65 relay list")
+	nip65Ctx, nip65Cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer nip65Cancel()
+
+	var relayListEvents []nostr.Event
+	for ev := range pool.FetchMany(nip65Ctx, seedRelays, nostr.Filter{
+		Authors: []nostr.PubKey{ownerPk},
+		Kinds:   []nostr.Kind{nostr.KindRelayListMetadata},
+	}, nostr.SubscriptionOptions{}) {
+		relayListEvents = append(relayListEvents, ev.Event)
+	}
+
+	writeRelays := ownerWriteRelaysFromEvents(relayListEvents)
+	if len(writeRelays) == 0 {
+		return nil
+	}
+
+	log.Printf("🔍 fetching owner's follows from %d NIP-65 write relays", len(writeRelays))
+	outboxCtx, outboxCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer outboxCancel()
+
+	for ev := range pool.FetchMany(outboxCtx, writeRelays, filter, nostr.SubscriptionOptions{}) {
+		followEvents = append(followEvents, ev.Event)
+	}
+	return followEvents
+}
+
 func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
-	runTrustNetworkRefresh := func() {
+	runTrustNetworkRefresh := func() bool {
 		atomic.AddUint64(&networkRefreshCount, 1)
 		start := time.Now()
 
@@ -572,23 +654,15 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 		}
 		followerMutex.RUnlock()
 
-		timeoutCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		defer cancel()
-
 		ownerPk, err := nostr.PubKeyFromHex(config.RelayPubkey)
 		if err != nil {
 			log.Printf("invalid RELAY_PUBKEY: %v", err)
-			return
-		}
-		filter := nostr.Filter{
-			Authors: []nostr.PubKey{ownerPk},
-			Kinds:   []nostr.Kind{nostr.KindFollowList},
+			return false
 		}
 
-		log.Println("🔍 fetching owner's follows")
-		eventCount := 0
-		for ev := range pool.FetchMany(timeoutCtx, seedRelays, filter, nostr.SubscriptionOptions{}) {
-			eventCount++
+		followEvents := fetchOwnerFollowEvents(ctx, ownerPk)
+		ownerFollowsSeen := len(followEvents) > 0
+		for _, ev := range followEvents {
 			for contact := range ev.Tags.FindAll("p") {
 				if len(contact) < 2 {
 					continue
@@ -607,7 +681,7 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 				}
 			}
 		}
-		log.Printf("🔍 processed %d follow list events", eventCount)
+		log.Printf("🔍 processed %d follow list events", len(followEvents))
 
 		log.Println("🌐 building web of trust graph")
 		var totalProcessed int64
@@ -684,18 +758,43 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 
 		duration := time.Since(start)
 		log.Printf("🫂 total network size: %d (processed %d events in %v)", len(newPubkeyFollowerCount), atomic.LoadInt64(&totalProcessed), duration)
+
+		return ownerFollowsSeen
 	}
 
 	ticker := time.NewTicker(time.Duration(config.RefreshInterval) * time.Hour)
 	defer ticker.Stop()
 
-	// Run initial refresh
+	// Run initial refresh, retrying until the owner's follow list is seen or
+	// the boot deadline expires (at which point we fall back to accept-all).
 	log.Println("🚀 performing initial trust network build...")
-	runTrustNetworkRefresh()
-	updateTrustNetworkFilter()
+	for attempt := 1; ; attempt++ {
+		ownerFollowsSeen := runTrustNetworkRefresh()
+		updateTrustNetworkFilter()
+		if ownerFollowsSeen {
+			trustNetworkMutex.RLock()
+			networkSize := len(trustNetwork)
+			trustNetworkMutex.RUnlock()
+			if networkSize == 0 {
+				log.Println("⚠️ owner follow list produced an empty trust network; events will be rejected until follows are added")
+			}
+			break
+		}
+		if attempt >= maxBootRetries {
+			log.Printf("⚠️ failed to fetch owner's follow list after %d attempts; opening relay in fallback accept-all mode until next refresh", attempt)
+			fallbackAcceptAll.Store(true)
+			break
+		}
+		log.Printf("🌱 no owner follow list fetched yet (attempt %d/%d), retrying in 1 minute...", attempt, maxBootRetries)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Minute):
+		}
+	}
 
-	// Mark as booted after initial trust network is built
-	booted = true
+	// Mark as booted once initial network build succeeds or boot deadline passes
+	booted.Store(true)
 	log.Println("✅ trust network initialized, relay is now active")
 
 	deleteOldNotes()
@@ -706,8 +805,11 @@ func refreshTrustNetwork(ctx context.Context, relay *khatru.Relay) {
 		select {
 		case <-ticker.C:
 			log.Println("🔄 refreshing trust network in background...")
-			runTrustNetworkRefresh()
+			ownerFollowsSeen := runTrustNetworkRefresh()
 			updateTrustNetworkFilter()
+			if ownerFollowsSeen {
+				fallbackAcceptAll.Store(false)
+			}
 			deleteOldNotes()
 			archiveTrustedNotes(ctx, relay)
 			log.Println("✅ trust network refresh completed")
